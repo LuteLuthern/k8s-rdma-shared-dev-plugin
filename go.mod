@@ -13,7 +13,7 @@ require (
 	github.com/vishvananda/netlink v1.1.0
 	golang.org/x/net v0.7.0
 	google.golang.org/grpc v1.26.0
-	k8s.io/kubelet v0.17.2
+	k8s.io/kubelet v0.24.14
 )
 
 require (
