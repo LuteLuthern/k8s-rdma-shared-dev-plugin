@@ -52,11 +52,11 @@ func (fs *FakeFilesystem) Use() func() {
 	// TODO: Remove writing pci.ids file once ghw is mocked
 	// This is to fix the CI failure where ghw lib fails to
 	// unzip pci.ids file downloaded from internet.
-	pciData, err := os.ReadFile("/usr/share/hwdata/pci.ids")
+	pciData, err := os.ReadFile("/usr/share/misc/pci.ids")
 	if err != nil {
 		panic(fmt.Errorf("error reading file: %s", err.Error()))
 	}
-	err = os.WriteFile(path.Join(fs.RootDir, "usr/share/hwdata/pci.ids"), pciData, 0600)
+	err = os.WriteFile(path.Join(fs.RootDir, "usr/share/misc/pci.ids"), pciData, 0600)
 	if err != nil {
 		panic(fmt.Errorf("error creating fake file: %s", err.Error()))
 	}
