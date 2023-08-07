@@ -383,7 +383,9 @@ func (rs *resourceServer) GetInfo(ctx context.Context, rqt *registerapi.InfoRequ
 }
 
 // GetPreferredAllocation returns the preferred allocation from the set of devices specified in the request
-func (rs *resourceServer) GetPreferredAllocation(ctx context.Context, r *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+func (rs *resourceServer) GetPreferredAllocation(
+	ctx context.Context,
+	r *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
 	return &pluginapi.PreferredAllocationResponse{}, nil
 }
 
