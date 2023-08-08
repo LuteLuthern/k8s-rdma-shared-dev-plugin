@@ -352,7 +352,8 @@ func (rs *resourceServer) Allocate(ctx context.Context, r *pluginapi.AllocateReq
 func (rs *resourceServer) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (
 	*pluginapi.DevicePluginOptions, error) {
 	return &pluginapi.DevicePluginOptions{
-		PreStartRequired: false,
+		PreStartRequired:                false,
+		GetPreferredAllocationAvailable: false,
 	}, nil
 }
 
@@ -379,6 +380,13 @@ func (rs *resourceServer) GetInfo(ctx context.Context, rqt *registerapi.InfoRequ
 		SupportedVersions: []string{"v1alpha1", "v1beta1"},
 	}
 	return pluginInfoResponse, nil
+}
+
+// GetPreferredAllocation returns the preferred allocation from the set of devices specified in the request
+func (rs *resourceServer) GetPreferredAllocation(
+	ctx context.Context,
+	r *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	return &pluginapi.PreferredAllocationResponse{}, nil
 }
 
 // NotifyRegistrationStatus notify for registration status
