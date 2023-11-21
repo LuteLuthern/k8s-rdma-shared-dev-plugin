@@ -1,3 +1,21 @@
+/*----------------------------------------------------
+
+  2023 NVIDIA CORPORATION & AFFILIATES
+
+  Licensed under the Apache License, Version 2.0 (the License);
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an AS IS BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+----------------------------------------------------*/
+
 package resources
 
 import (
@@ -11,17 +29,21 @@ import (
 	"time"
 
 	"golang.org/x/net/context"
-	"google.golang.org/grpc"
+	grpc "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 
+	"github.com/Mellanox/k8s-rdma-shared-dev-plugin/pkg/cdi"
 	"github.com/Mellanox/k8s-rdma-shared-dev-plugin/pkg/types"
 )
 
 const (
 	// Local use
-	cDialTimeout  = 5 * time.Second
-	watchWaitTime = 5 * time.Second
+	cDialTimeout      = 5 * time.Second
+	watchWaitTime     = 5 * time.Second
+	cdiResourcePrefix = "nvidia.com"
+	cdiResourceKind   = "net-rdma"
 )
 
 type resourcesServerPort struct {
@@ -33,16 +55,19 @@ type resourceServer struct {
 	watchMode      bool
 	socketName     string
 	socketPath     string
-	stop           chan interface{}
 	stopWatcher    chan bool
 	updateResource chan bool
 	health         chan *pluginapi.Device
 	rsConnector    types.ResourceServerPort
 	rdmaHcaMax     int
 	// Mutex protects devs and deviceSpec
-	mutex      sync.RWMutex
-	devs       []*pluginapi.Device
-	deviceSpec []*pluginapi.DeviceSpec
+	mutex           sync.RWMutex
+	devs            []*pluginapi.Device
+	deviceSpec      []*pluginapi.DeviceSpec
+	pciDevices      []types.PciNetDevice
+	useCdi          bool
+	cdi             cdi.CDI
+	cdiResourceName string
 }
 
 func (rsc *resourcesServerPort) GetServer() *grpc.Server {
@@ -83,31 +108,22 @@ func (rsc *resourcesServerPort) Register(client pluginapi.RegistrationClient, re
 func (rsc *resourcesServerPort) Dial(unixSocketPath string, timeout time.Duration) (*grpc.ClientConn, error) {
 	var c *grpc.ClientConn
 	var err error
-	connChannel := make(chan interface{})
 
-	ctx, timeoutCancel := context.WithTimeout(context.TODO(), timeout)
+	ctx, timeoutCancel := context.WithTimeout(context.Background(), timeout)
 	defer timeoutCancel()
-	go func() {
-		c, err = grpc.DialContext(ctx, unixSocketPath, grpc.WithInsecure(),
-			grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-				return net.Dial("unix", addr)
-			}),
-		)
-		connChannel <- "done"
-	}()
+	c, err = grpc.DialContext(
+		ctx, "unix://"+unixSocketPath, grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("timout while trying to connect %s", unixSocketPath)
-
-	case <-connChannel:
-		return c, err
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect %s, %w", unixSocketPath, err)
 	}
+
+	return c, nil
 }
 
 // newResourceServer returns an initialized server
 func newResourceServer(config *types.UserConfig, devices []types.PciNetDevice, watcherMode bool,
-	socketSuffix string) (types.ResourceServer, error) {
+	socketSuffix string, useCdi bool) (types.ResourceServer, error) {
 	var devs []*pluginapi.Device
 
 	sockDir := activeSockDir
@@ -141,18 +157,21 @@ func newResourceServer(config *types.UserConfig, devices []types.PciNetDevice, w
 	socketName := fmt.Sprintf("%s.%s", config.ResourceName, socketSuffix)
 
 	return &resourceServer{
-		resourceName:   fmt.Sprintf("%s/%s", config.ResourcePrefix, config.ResourceName),
-		socketName:     socketName,
-		socketPath:     filepath.Join(sockDir, socketName),
-		watchMode:      watcherMode,
-		devs:           devs,
-		deviceSpec:     deviceSpec,
-		stop:           make(chan interface{}),
-		stopWatcher:    make(chan bool),
-		updateResource: make(chan bool, 1),
-		health:         make(chan *pluginapi.Device),
-		rsConnector:    &resourcesServerPort{},
-		rdmaHcaMax:     config.RdmaHcaMax,
+		resourceName:    fmt.Sprintf("%s/%s", config.ResourcePrefix, config.ResourceName),
+		socketName:      socketName,
+		socketPath:      filepath.Join(sockDir, socketName),
+		watchMode:       watcherMode,
+		devs:            devs,
+		deviceSpec:      deviceSpec,
+		stopWatcher:     make(chan bool),
+		updateResource:  make(chan bool, 1),
+		health:          make(chan *pluginapi.Device),
+		rsConnector:     &resourcesServerPort{},
+		rdmaHcaMax:      config.RdmaHcaMax,
+		pciDevices:      devices,
+		useCdi:          useCdi,
+		cdi:             cdi.New(),
+		cdiResourceName: config.ResourceName,
 	}, nil
 }
 
@@ -206,12 +225,11 @@ func (rs *resourceServer) Stop() error {
 		return nil
 	}
 
-	// Send terminate signal to ListAndWatch()
-	rs.stop <- true
 	if !rs.watchMode {
 		rs.stopWatcher <- true
 	}
 
+	// Note: stopping RPC server will cancel any outstanding ListAndWatch() calls
 	rs.rsConnector.Stop()
 	rs.rsConnector.DeleteServer()
 
@@ -227,9 +245,6 @@ func (rs *resourceServer) Restart() error {
 
 	rs.rsConnector.Stop()
 	rs.rsConnector.DeleteServer()
-
-	// Send terminate signal to ListAndWatch()
-	rs.stop <- true
 
 	return rs.Start()
 }
@@ -281,6 +296,7 @@ func (rs *resourceServer) register() error {
 
 // ListAndWatch lists devices and update that list according to the health status
 func (rs *resourceServer) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
+	log.Printf("ListAndWatch called by kubelet for: %s", rs.resourceName)
 	resp := new(pluginapi.ListAndWatchResponse)
 
 	// Send initial list of devices
@@ -288,12 +304,18 @@ func (rs *resourceServer) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlu
 		return err
 	}
 
+	rs.mutex.RLock()
+	err := rs.updateCDISpec()
+	rs.mutex.RUnlock()
+	if err != nil {
+		log.Printf("cannot update CDI specs: %v", err)
+		return err
+	}
+
 	for {
 		select {
 		case <-s.Context().Done():
 			log.Printf("ListAndWatch stream close: %v", s.Context().Err())
-			return nil
-		case <-rs.stop:
 			return nil
 		case d := <-rs.health:
 			// FIXME: there is no way to recover from the Unhealthy state.
@@ -306,8 +328,26 @@ func (rs *resourceServer) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlu
 				rs.updateResource <- true
 				return err
 			}
+			err := rs.updateCDISpec()
+			if err != nil {
+				log.Printf("cannot update CDI specs: %v", err)
+				return err
+			}
 		}
 	}
+}
+
+func (rs *resourceServer) updateCDISpec() error {
+	// check if CDI mode is enabled
+	if !rs.useCdi {
+		return nil
+	}
+	err := rs.cdi.CreateCDISpec(cdiResourcePrefix, cdiResourceKind, rs.cdiResourceName, rs.pciDevices)
+	if err != nil {
+		log.Printf("updateCDISpec(): error creating CDI spec: %v", err)
+		return err
+	}
+	return nil
 }
 
 func (rs *resourceServer) sendDevices(resp *pluginapi.ListAndWatchResponse,
@@ -335,8 +375,17 @@ func (rs *resourceServer) Allocate(ctx context.Context, r *pluginapi.AllocateReq
 	ress := make([]*pluginapi.ContainerAllocateResponse, len(r.GetContainerRequests()))
 
 	for i := range r.GetContainerRequests() {
-		ress[i] = &pluginapi.ContainerAllocateResponse{
-			Devices: rs.deviceSpec,
+		ress[i] = &pluginapi.ContainerAllocateResponse{}
+
+		if rs.useCdi {
+			var err error
+			ress[i].Annotations, err = rs.cdi.CreateContainerAnnotations(
+				rs.pciDevices, cdiResourcePrefix, cdiResourceKind)
+			if err != nil {
+				return nil, fmt.Errorf("cant create container annotation: %s", err)
+			}
+		} else {
+			ress[i].Devices = rs.deviceSpec
 		}
 	}
 
@@ -425,12 +474,11 @@ func (rs *resourceServer) UpdateDevices(devices []types.PciNetDevice) {
 	}
 
 	rs.deviceSpec = deviceSpec
+	needUpdate = true
 
 	// In case no RDMA resource report 0 resources
 	if len(rs.deviceSpec) == 0 {
 		rs.devs = []*pluginapi.Device{}
-		needUpdate = true
-
 		return
 	}
 
@@ -447,8 +495,11 @@ func (rs *resourceServer) UpdateDevices(devices []types.PciNetDevice) {
 		}
 		rs.devs = devs
 	}
+}
 
-	needUpdate = true
+func (rs *resourceServer) GetPreferredAllocation(
+	ctx context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	return nil, nil
 }
 
 // devicesChanged detect if original and new devices are different

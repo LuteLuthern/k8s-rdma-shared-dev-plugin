@@ -1,3 +1,21 @@
+/*----------------------------------------------------
+
+  2023 NVIDIA CORPORATION & AFFILIATES
+
+  Licensed under the Apache License, Version 2.0 (the License);
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an AS IS BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+----------------------------------------------------*/
+
 package resources
 
 import (
@@ -12,13 +30,14 @@ import (
 	"github.com/jaypipes/ghw"
 	"github.com/vishvananda/netlink"
 
+	"github.com/Mellanox/k8s-rdma-shared-dev-plugin/pkg/cdi"
 	"github.com/Mellanox/k8s-rdma-shared-dev-plugin/pkg/types"
 	"github.com/Mellanox/k8s-rdma-shared-dev-plugin/pkg/utils"
 )
 
 const (
 	// General constants
-	configFilePath        = "/k8s-rdma-shared-dev-plugin/config.json"
+	DefaultConfigFilePath = "/k8s-rdma-shared-dev-plugin/config.json"
 	kubeEndPoint          = "kubelet.sock"
 	socketSuffix          = "sock"
 	rdmaHcaResourcePrefix = "rdma"
@@ -52,9 +71,10 @@ type resourceManager struct {
 	netlinkManager         types.NetlinkManager
 	rds                    types.RdmaDeviceSpec
 	PeriodicUpdateInterval time.Duration
+	useCdi                 bool
 }
 
-func NewResourceManager() types.ResourceManager {
+func NewResourceManager(configFile string, useCdi bool) types.ResourceManager {
 	watcherMode := detectPluginWatchMode(activeSockDir)
 	if watcherMode {
 		fmt.Println("Using Kubelet Plugin Registry Mode")
@@ -62,12 +82,13 @@ func NewResourceManager() types.ResourceManager {
 		fmt.Println("Using Deprecated Devie Plugin Registry Path")
 	}
 	return &resourceManager{
-		configFile:            configFilePath,
+		configFile:            configFile,
 		defaultResourcePrefix: rdmaHcaResourcePrefix,
 		socketSuffix:          socketSuffix,
 		watchMode:             watcherMode,
 		netlinkManager:        &netlinkManager{},
 		rds:                   NewRdmaDeviceSpec(requiredRdmaDevices),
+		useCdi:                useCdi,
 	}
 }
 
@@ -201,7 +222,13 @@ func (rm *resourceManager) InitServers() error {
 			log.Printf("Warning: no devices in device pool, creating empty resource server for %s", config.ResourceName)
 		}
 
-		rs, err := newResourceServer(config, filteredDevices, rm.watchMode, rm.socketSuffix)
+		if rm.useCdi {
+			err := cdi.CleanupSpecs(cdiResourcePrefix)
+			if err != nil {
+				return err
+			}
+		}
+		rs, err := newResourceServer(config, filteredDevices, rm.watchMode, rm.socketSuffix, rm.useCdi)
 		if err != nil {
 			return err
 		}
@@ -227,6 +254,12 @@ func (rm *resourceManager) StartAllServers() error {
 
 // StopAllServers stop all servers
 func (rm *resourceManager) StopAllServers() error {
+	if rm.useCdi {
+		err := cdi.CleanupSpecs(cdiResourcePrefix)
+		if err != nil {
+			return err
+		}
+	}
 	for _, rs := range rm.resourceServers {
 		if err := rs.Stop(); err != nil {
 			return err
@@ -237,6 +270,12 @@ func (rm *resourceManager) StopAllServers() error {
 
 // RestartAllServers restart all servers
 func (rm *resourceManager) RestartAllServers() error {
+	if rm.useCdi {
+		err := cdi.CleanupSpecs(cdiResourcePrefix)
+		if err != nil {
+			return err
+		}
+	}
 	for _, rs := range rm.resourceServers {
 		if err := rs.Restart(); err != nil {
 			return err
