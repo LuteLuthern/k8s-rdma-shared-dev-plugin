@@ -1,3 +1,4 @@
+ARG BASE_IMAGE=alpine:3.18.2
 FROM golang:alpine as builder
 
 COPY . /usr/src/k8s-rdma-shared-dp
@@ -10,7 +11,7 @@ WORKDIR /usr/src/k8s-rdma-shared-dp
 RUN make clean && \
     make build
 
-FROM alpine:3.18.2
+FROM ${BASE_IMAGE}
 RUN apk add --no-cache kmod=30-r3 hwdata-pci=0.370-r0
 COPY --from=builder /usr/src/k8s-rdma-shared-dp/build/k8s-rdma-shared-dp /bin/
 
